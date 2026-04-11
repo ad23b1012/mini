@@ -1,0 +1,167 @@
+# ============================================================
+# Multimodal Emotion Recognition with XAI + NLG
+# Master Configuration
+# ============================================================
+
+# ---------- Project ----------
+project:
+  name: "MMER-XAI"
+  seed: 42
+  device: "cuda"                    # "cuda" or "cpu"
+  output_dir: "./results"
+  log_dir: "./results/logs"
+  checkpoint_dir: "./results/checkpoints"
+
+# ---------- Dataset ----------
+dataset:
+  name: "meld"                      # "affectnet" or "meld"
+  
+  affectnet:
+    root_dir: "./datasets/affectnet"
+    num_classes: 8                   # neutral, happy, sad, surprise, fear, disgust, anger, contempt
+    image_size: 260                  # EfficientNet-B2 native
+    class_names:
+      - "Neutral"
+      - "Happy"
+      - "Sad"
+      - "Surprise"
+      - "Fear"
+      - "Disgust"
+      - "Anger"
+      - "Contempt"
+
+  meld:
+    root_dir: "./datasets/meld"
+    num_classes: 7                   # neutral, surprise, fear, sadness, joy, disgust, anger
+    image_size: 260
+    max_text_length: 128
+    class_names:
+      - "Neutral"
+      - "Surprise"
+      - "Fear"
+      - "Sadness"
+      - "Joy"
+      - "Disgust"
+      - "Anger"
+    sentiment_classes: 3             # positive, negative, neutral
+
+# ---------- Model ----------
+model:
+  # Vision encoder
+  vision:
+    backbone: "efficientnet_b2"      # timm model name
+    pretrained: true
+    feature_dim: 1408                # EfficientNet-B2 feature dim
+    dropout: 0.3
+    freeze_layers: 0                 # Number of initial blocks to freeze (0 = train all)
+
+  # Text encoder
+  text:
+    backbone: "microsoft/deberta-v3-base"   # HuggingFace model name
+    pretrained: true
+    feature_dim: 768                 # DeBERTa-v3-base hidden size
+    dropout: 0.1
+    freeze_layers: 0                 # Number of layers to freeze
+    max_length: 128
+
+  # Fusion
+  fusion:
+    strategy: "cross_attention"      # "cross_attention", "gated", "concat", "attention_pool"
+    hidden_dim: 512
+    num_heads: 8
+    dropout: 0.2
+    num_layers: 2                    # Number of cross-attention layers
+
+  # Classifier head
+  classifier:
+    hidden_dims: [256, 128]
+    dropout: 0.3
+    activation: "gelu"
+
+# ---------- Training ----------
+training:
+  epochs: 50
+  batch_size: 32                     # Adjust based on your GPU VRAM
+  accumulation_steps: 1              # Gradient accumulation
+  
+  optimizer:
+    name: "adamw"
+    lr: 2.0e-4
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+    
+    # Separate LR for encoders (typically lower)
+    vision_lr: 1.0e-5
+    text_lr: 2.0e-5
+
+  scheduler:
+    name: "cosine_warmup"            # "cosine_warmup", "step", "plateau"
+    warmup_epochs: 3
+    min_lr: 1.0e-7
+    T_max: 50                        # For cosine scheduler
+
+  loss:
+    name: "focal"                    # "focal", "ce", "label_smoothing"
+    focal_gamma: 2.0
+    focal_alpha: null                # Set to list of per-class weights, or null for uniform
+    label_smoothing: 0.1
+
+  early_stopping:
+    patience: 10
+    metric: "val_f1_weighted"
+    mode: "max"
+
+  # Mixed precision
+  amp: true
+  
+  # Data loading
+  num_workers: 4
+  pin_memory: true
+
+  # Logging
+  log_every_n_steps: 50
+  val_every_n_epochs: 1
+  save_top_k: 3                      # Keep top-k checkpoints
+
+# ---------- Explainability (XAI) ----------
+xai:
+  gradcam:
+    target_layer: "features.8"       # Last conv block of EfficientNet-B2
+    num_samples: 100                 # Number of samples to explain
+    
+  shap:
+    method: "partition"              # "partition" or "kernel"
+    max_evals: 500                   # SHAP evaluation budget
+    batch_size: 16
+
+  faithfulness:
+    num_perturbation_steps: 10       # Steps for perturbation curve
+    top_k_features: 5               # Top features for consistency check
+    metrics:
+      - "sufficiency"               # Do top features suffice for prediction?
+      - "comprehensiveness"         # Does removing top features change prediction?
+      - "cross_modal_agreement"     # Do vision and text explanations agree?
+
+# ---------- NLG Report ----------
+nlg:
+  mode: "template"                   # "template" or "llm"
+  
+  template:
+    min_importance: 0.05             # Minimum feature importance to include
+    max_features: 5                  # Max features per modality in report
+    
+  llm:
+    provider: "ollama"               # "ollama", "openai"
+    model: "llama3.1:8b"             # Local model via Ollama
+    temperature: 0.3
+    max_tokens: 512
+
+# ---------- Ablation ----------
+ablation:
+  modes:
+    - "vision_only"
+    - "text_only"
+    - "multimodal_concat"
+    - "multimodal_gated"
+    - "multimodal_cross_attention"
+  quick_epochs: 10                   # Fewer epochs for ablation runs

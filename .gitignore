@@ -1,0 +1,40 @@
+# MMER-XAI
+
+# Byte-compiled
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+env/
+.env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Datasets (too large for git)
+datasets/
+*.tar.gz
+*.zip
+
+# Results and checkpoints
+results/
+*.pt
+*.pth
+*.ckpt
+
+# Logs
+*.log
+wandb/
+runs/
+
+# Jupyter
+.ipynb_checkpoints/

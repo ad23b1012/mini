@@ -19,13 +19,13 @@ We present MMER-XAI, a multimodal emotion recognition system that not only class
 ## 🏗️ Architecture
 
 ```
-Input Face Image ──→ EfficientNet-B2 ──→ Visual Features ──→┐
-                                                              │──→ Cross-Attention ──→ Classifier ──→ Emotion
-Input Text       ──→ DeBERTa-v3-base ──→ Text Features  ──→┘       Fusion
+Input Face Image   → EfficientNet-B2   → Visual Features →┐
+                                                          │→ Cross-Attention → Classifier → Emotion
+Input Text         → DeBERTa-v3-base   → Text Features   →┘       Fusion
                                                               
-Visual Features ──→ Grad-CAM ──→ Region Scores ──→┐
-                                                    │──→ CMFS Faithfulness Score 
-Text Features   ──→ SHAP     ──→ Token Scores  ──→┘
+Visual Features → Grad-CAM → Region Scores →┐
+                                            │→ CMFS Faithfulness Score 
+Text Features   → SHAP     → Token Scores  →┘
 ```
 
 ## 🚀 One-Click Pipeline Execution

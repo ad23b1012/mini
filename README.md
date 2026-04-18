@@ -102,7 +102,3 @@ If you use this code in your research, please cite:
   year={2026},
 }
 ```
-
-## 📜 License
-
-MIT License

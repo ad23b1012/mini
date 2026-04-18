@@ -40,6 +40,16 @@ plt.rcParams.update(
 )
 
 
+def _is_finite_number(value) -> bool:
+    return isinstance(value, (int, float, np.floating, np.integer)) and np.isfinite(
+        float(value)
+    )
+
+
+def _format_metric(value) -> str:
+    return f"{float(value):.3f}" if _is_finite_number(value) else "n/a"
+
+
 def plot_gradcam_overlay(
     original_image: np.ndarray,
     heatmap: np.ndarray,
@@ -96,7 +106,8 @@ def plot_gradcam_overlay(
     plt.tight_layout()
 
     if save_path:
-        plt.savefig(save_path)
+        fig.savefig(save_path)
+        plt.close(fig)
         print(f"  Saved Grad-CAM overlay to {save_path}")
 
     return fig
@@ -153,7 +164,8 @@ def plot_shap_tokens(
     plt.tight_layout()
 
     if save_path:
-        plt.savefig(save_path)
+        fig.savefig(save_path)
+        plt.close(fig)
         print(f"  Saved SHAP plot to {save_path}")
 
     return fig
@@ -191,7 +203,8 @@ def plot_region_importance(
     plt.tight_layout()
 
     if save_path:
-        plt.savefig(save_path)
+        fig.savefig(save_path)
+        plt.close(fig)
 
     return fig
 
@@ -238,7 +251,8 @@ def plot_confusion_matrix(
     plt.tight_layout()
 
     if save_path:
-        plt.savefig(save_path)
+        fig.savefig(save_path)
+        plt.close(fig)
         print(f"  Saved confusion matrix to {save_path}")
 
     return fig
@@ -337,16 +351,17 @@ def plot_combined_explanation(
         info_lines.append("")
         info_lines.append("── Faithfulness Metrics ──")
         info_lines.append(
-            f"CMFS Score: {faithfulness_metrics.get('cmfs_score', 0):.3f}"
+            f"CMFS Score: {_format_metric(faithfulness_metrics.get('cmfs_score'))}"
         )
         info_lines.append(
-            f"Cross-Modal Agreement: {faithfulness_metrics.get('cross_modal_agreement', 0):.3f}"
+            "Cross-Modal Agreement: "
+            f"{_format_metric(faithfulness_metrics.get('cross_modal_agreement'))}"
         )
         info_lines.append(
-            f"Vision Sufficiency: {faithfulness_metrics.get('vision_sufficiency', 0):.3f}"
+            f"Vision Sufficiency: {_format_metric(faithfulness_metrics.get('vision_sufficiency'))}"
         )
         info_lines.append(
-            f"Text Sufficiency: {faithfulness_metrics.get('text_sufficiency', 0):.3f}"
+            f"Text Sufficiency: {_format_metric(faithfulness_metrics.get('text_sufficiency'))}"
         )
 
     info_text = "\n".join(info_lines)
@@ -369,7 +384,8 @@ def plot_combined_explanation(
     )
 
     if save_path:
-        plt.savefig(save_path)
+        fig.savefig(save_path)
+        plt.close(fig)
         print(f"  Saved combined explanation to {save_path}")
 
     return fig
@@ -383,10 +399,27 @@ def plot_perturbation_curves(
     """Plot perturbation fidelity curves for both modalities."""
     fig, ax = plt.subplots(figsize=(8, 5))
 
-    x = np.linspace(0, 100, len(vision_curve))
+    vision_curve = np.asarray(vision_curve, dtype=np.float32)
+    text_curve = np.asarray(text_curve, dtype=np.float32)
 
-    ax.plot(x, vision_curve, "b-o", label="Vision (Grad-CAM)", markersize=4)
-    ax.plot(x, text_curve, "r-s", label="Text (SHAP)", markersize=4)
+    if vision_curve.size:
+        vision_x = np.linspace(0, 100, len(vision_curve))
+        ax.plot(
+            vision_x,
+            vision_curve,
+            "b-o",
+            label="Vision (Grad-CAM)",
+            markersize=4,
+        )
+    if text_curve.size:
+        text_x = np.linspace(0, 100, len(text_curve))
+        ax.plot(
+            text_x,
+            text_curve,
+            "r-s",
+            label="Text (SHAP)",
+            markersize=4,
+        )
     ax.set_xlabel("% Features Removed (most important first)")
     ax.set_ylabel("Prediction Confidence")
     ax.set_title("Perturbation Fidelity Curves", fontweight="bold")
@@ -394,12 +427,20 @@ def plot_perturbation_curves(
     ax.grid(True, alpha=0.3)
 
     # Add AUC annotations
-    vision_auc = np.trapz(vision_curve, x / 100)
-    text_auc = np.trapz(text_curve, x / 100)
+    vision_auc = (
+        np.trapz(vision_curve, np.linspace(0, 1, len(vision_curve)))
+        if vision_curve.size
+        else float("nan")
+    )
+    text_auc = (
+        np.trapz(text_curve, np.linspace(0, 1, len(text_curve)))
+        if text_curve.size
+        else float("nan")
+    )
     ax.text(
         0.95,
         0.95,
-        f"Vision AUC: {vision_auc:.3f}\nText AUC: {text_auc:.3f}",
+        f"Vision AUC: {_format_metric(vision_auc)}\nText AUC: {_format_metric(text_auc)}",
         transform=ax.transAxes,
         fontsize=10,
         verticalalignment="top",
@@ -410,6 +451,7 @@ def plot_perturbation_curves(
     plt.tight_layout()
 
     if save_path:
-        plt.savefig(save_path)
+        fig.savefig(save_path)
+        plt.close(fig)
 
     return fig

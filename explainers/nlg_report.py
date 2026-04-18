@@ -23,9 +23,11 @@ Example output:
     the sadness signal."
 """
 
-from typing import Dict, List, Optional
 import json
+import math
+import re
 import subprocess
+from typing import Dict, List, Optional
 
 
 # Emotion descriptions for richer NLG
@@ -126,6 +128,60 @@ class NLGReportGenerator:
         self.llm_model = llm_model
         self.llm_provider = llm_provider
 
+    @staticmethod
+    def _is_finite(value) -> bool:
+        return isinstance(value, (int, float)) and math.isfinite(float(value))
+
+    @staticmethod
+    def _is_word_like(token: str) -> bool:
+        return bool(re.search(r"[A-Za-z0-9]", token))
+
+    def _select_report_tokens(
+        self,
+        token_importance: Dict[str, float],
+        positive: bool,
+        limit: int,
+    ) -> List[tuple[str, float]]:
+        """Prefer actual word pieces over bare punctuation in the narrative."""
+        candidates = [
+            (token, score)
+            for token, score in token_importance.items()
+            if (score > self.min_importance if positive else score < -self.min_importance)
+        ]
+        if not candidates:
+            return []
+
+        primary = [item for item in candidates if self._is_word_like(item[0])]
+        fallback = [item for item in candidates if not self._is_word_like(item[0])]
+        ordered = primary + fallback
+        return ordered[:limit]
+
+    def _describe_sufficiency(self, value: float, modality_name: str) -> str:
+        """Turn sufficiency into calibrated English instead of overclaiming."""
+        if not self._is_finite(value):
+            return f"{modality_name} sufficiency is unavailable for this sample."
+        if value > 1.05:
+            return (
+                f"{modality_name} sufficiency: {value:.3f} — masking down to the "
+                f"highlighted {modality_name.lower()} features increased confidence, "
+                "so this estimate is unstable rather than strongly faithful."
+            )
+        if value >= 0.75:
+            return (
+                f"{modality_name} sufficiency: {value:.3f} — the highlighted "
+                f"{modality_name.lower()} features retain most of the signal."
+            )
+        if value >= 0.40:
+            return (
+                f"{modality_name} sufficiency: {value:.3f} — the highlighted "
+                f"{modality_name.lower()} features capture part of the signal, "
+                "but surrounding context still matters."
+            )
+        return (
+            f"{modality_name} sufficiency: {value:.3f} — the prediction depends on "
+            f"broader {modality_name.lower()} context beyond the highlighted features."
+        )
+
     def generate_report(
         self,
         emotion_name: str,
@@ -200,6 +256,13 @@ class NLGReportGenerator:
             lines.append(f'Utterance: "{utterance}"')
         lines.append("")
 
+        if confidence < 0.30:
+            lines.append(
+                "This is a low-confidence prediction, so the explanation should be "
+                "read as tentative."
+            )
+            lines.append("")
+
         # Get emotion description
         emo_info = EMOTION_DESCRIPTIONS.get(emotion_name, {})
         if emo_info:
@@ -255,15 +318,16 @@ class NLGReportGenerator:
         lines.append("")
 
         # Get top positive and negative tokens
-        positive_tokens = [
-            (t, s) for t, s in token_importance.items()
-            if s > self.min_importance
-        ][: self.max_features]
-
-        negative_tokens = sorted(
-            [(t, s) for t, s in token_importance.items() if s < -self.min_importance],
-            key=lambda x: x[1],
-        )[: 3]
+        positive_tokens = self._select_report_tokens(
+            token_importance,
+            positive=True,
+            limit=self.max_features,
+        )
+        negative_tokens = self._select_report_tokens(
+            token_importance,
+            positive=False,
+            limit=3,
+        )
 
         if positive_tokens:
             primary_token, primary_shap = positive_tokens[0]
@@ -303,36 +367,46 @@ class NLGReportGenerator:
             lines.append("--- Explanation Quality Metrics ---")
             lines.append("")
 
-            cmfs = faithfulness_metrics.get("cmfs_score", 0)
-            lines.append(
-                f"Cross-Modal Faithfulness Score (CMFS): {cmfs:.3f}"
-            )
-
-            agreement = faithfulness_metrics.get("cross_modal_agreement", 0)
-            if agreement > 0.7:
-                agreement_desc = "strong agreement"
-            elif agreement > 0.4:
-                agreement_desc = "moderate agreement"
+            cmfs = faithfulness_metrics.get("cmfs_score", float("nan"))
+            if self._is_finite(cmfs):
+                lines.append(
+                    f"Cross-Modal Faithfulness Score (CMFS): {cmfs:.3f}"
+                )
             else:
-                agreement_desc = "weak agreement"
+                lines.append(
+                    "Cross-Modal Faithfulness Score (CMFS): unavailable for this sample."
+                )
+
+            agreement = faithfulness_metrics.get("cross_modal_agreement", float("nan"))
+            if self._is_finite(agreement):
+                if agreement > 0.7:
+                    agreement_desc = "strong agreement"
+                elif agreement > 0.4:
+                    agreement_desc = "moderate agreement"
+                else:
+                    agreement_desc = "weak agreement"
+
+                lines.append(
+                    f"Cross-Modal Agreement: {agreement:.3f} ({agreement_desc}) — "
+                    f"visual and textual explanations {'consistently support' if agreement > 0.5 else 'show noticeable divergence in'} "
+                    f"the {emotion_name.lower()} prediction."
+                )
+            else:
+                lines.append(
+                    "Cross-Modal Agreement: unavailable for this sample."
+                )
 
             lines.append(
-                f"Cross-Modal Agreement: {agreement:.3f} ({agreement_desc}) — "
-                f"visual and textual explanations {'consistently support' if agreement > 0.5 else 'show some divergence in'} "
-                f"the {emotion_name.lower()} prediction."
-            )
-
-            # Sufficiency interpretation
-            v_suff = faithfulness_metrics.get("vision_sufficiency", 0)
-            t_suff = faithfulness_metrics.get("text_sufficiency", 0)
-            lines.append(
-                f"Vision Sufficiency: {v_suff:.3f} — "
-                f"{'the key facial regions alone are sufficient' if v_suff > 0.7 else 'facial context beyond key regions matters'} "
-                f"for this prediction."
+                self._describe_sufficiency(
+                    faithfulness_metrics.get("vision_sufficiency", float("nan")),
+                    "Vision",
+                )
             )
             lines.append(
-                f"Text Sufficiency: {t_suff:.3f} — "
-                f"{'the key words alone drive the prediction' if t_suff > 0.7 else 'surrounding context contributes significantly'}."
+                self._describe_sufficiency(
+                    faithfulness_metrics.get("text_sufficiency", float("nan")),
+                    "Text",
+                )
             )
 
             lines.append("")
@@ -376,12 +450,12 @@ class NLGReportGenerator:
         }
 
         if faithfulness_metrics:
-            xai_data["cross_modal_agreement"] = (
-                f"{faithfulness_metrics.get('cross_modal_agreement', 0):.3f}"
-            )
-            xai_data["cmfs_score"] = (
-                f"{faithfulness_metrics.get('cmfs_score', 0):.3f}"
-            )
+            agreement = faithfulness_metrics.get("cross_modal_agreement", float("nan"))
+            cmfs = faithfulness_metrics.get("cmfs_score", float("nan"))
+            if self._is_finite(agreement):
+                xai_data["cross_modal_agreement"] = f"{agreement:.3f}"
+            if self._is_finite(cmfs):
+                xai_data["cmfs_score"] = f"{cmfs:.3f}"
 
         prompt = f"""You are an AI emotion analysis expert. Given the following XAI 
 (Explainable AI) data from a multimodal emotion recognition model, write a clear, 

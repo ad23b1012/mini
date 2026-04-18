@@ -65,6 +65,8 @@ class CrossModalFaithfulness:
         attention_mask: torch.Tensor,
         gradcam_heatmap: np.ndarray,
         shap_values: np.ndarray,
+        model_token_scores: np.ndarray,
+        special_token_mask: np.ndarray,
         tokens: List[str],
         target_class: int,
     ) -> Dict[str, float]:
@@ -77,6 +79,8 @@ class CrossModalFaithfulness:
             attention_mask: Text mask [1, seq_len].
             gradcam_heatmap: Grad-CAM output [H, W].
             shap_values: SHAP values per token [num_tokens].
+            model_token_scores: SHAP scores aligned to model token positions.
+            special_token_mask: Boolean mask for special tokens in input_ids.
             tokens: Token strings.
             target_class: Predicted emotion class index.
 
@@ -97,12 +101,22 @@ class CrossModalFaithfulness:
 
         # 3. Text Sufficiency
         metrics["text_sufficiency"] = self._text_sufficiency(
-            image, input_ids, attention_mask, shap_values, target_class
+            image,
+            input_ids,
+            attention_mask,
+            model_token_scores,
+            special_token_mask,
+            target_class,
         )
 
         # 4. Text Comprehensiveness
         metrics["text_comprehensiveness"] = self._text_comprehensiveness(
-            image, input_ids, attention_mask, shap_values, target_class
+            image,
+            input_ids,
+            attention_mask,
+            model_token_scores,
+            special_token_mask,
+            target_class,
         )
 
         # 5. Cross-Modal Agreement (NOVEL)
@@ -115,15 +129,88 @@ class CrossModalFaithfulness:
             image, input_ids, attention_mask, gradcam_heatmap, target_class
         )
         text_fidelity = self._text_perturbation_curve(
-            image, input_ids, attention_mask, shap_values, target_class
+            image,
+            input_ids,
+            attention_mask,
+            model_token_scores,
+            special_token_mask,
+            target_class,
         )
-        metrics["vision_auc_fidelity"] = float(np.trapz(vision_fidelity))
-        metrics["text_auc_fidelity"] = float(np.trapz(text_fidelity))
+        metrics["vision_auc_fidelity"] = self._safe_auc(vision_fidelity)
+        metrics["text_auc_fidelity"] = self._safe_auc(text_fidelity)
 
         # 7. Combined CMFS score (geometric mean of key metrics)
         metrics["cmfs_score"] = self._compute_cmfs(metrics)
 
         return metrics
+
+    @staticmethod
+    def _safe_auc(curve: np.ndarray) -> float:
+        """Return a finite AUC when possible; otherwise expose NaN."""
+        curve = np.asarray(curve, dtype=np.float32)
+        if curve.size == 0 or not np.all(np.isfinite(curve)):
+            return float("nan")
+        return float(np.trapz(curve))
+
+    @staticmethod
+    def _get_pad_token_id(model: torch.nn.Module) -> int:
+        """Resolve the padding token ID from the text encoder config."""
+        return getattr(model.text_encoder.backbone.config, "pad_token_id", 0) or 0
+
+    def _get_text_feature_indices(
+        self,
+        attention_mask: torch.Tensor,
+        model_token_scores: np.ndarray,
+        special_token_mask: np.ndarray,
+    ) -> np.ndarray:
+        """Select the top-k explainable text positions from aligned scores."""
+        scores = np.abs(np.asarray(model_token_scores, dtype=np.float32))
+        attention = attention_mask[0].detach().cpu().numpy().astype(bool)
+        special_mask = np.asarray(special_token_mask, dtype=bool)
+        candidate_mask = attention & (~special_mask)
+        candidate_indices = np.flatnonzero(candidate_mask)
+
+        if candidate_indices.size == 0:
+            return np.array([], dtype=np.int64)
+
+        ranked = candidate_indices[np.argsort(scores[candidate_indices])]
+        top_k = min(self.top_k, ranked.size)
+        return ranked[-top_k:]
+
+    def _build_text_variant(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        keep_indices: np.ndarray,
+        special_token_mask: np.ndarray,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Mask text while always preserving special tokens."""
+        seq_len = input_ids.shape[1]
+        keep = np.zeros(seq_len, dtype=bool)
+        keep[np.asarray(keep_indices, dtype=np.int64)] = True
+
+        attention = attention_mask[0].detach().cpu().numpy().astype(bool)
+        keep |= np.asarray(special_token_mask, dtype=bool)
+        keep &= attention
+
+        # Fallback for degenerate cases: preserve the first attended position.
+        if not keep.any():
+            first_valid = np.flatnonzero(attention)
+            if first_valid.size > 0:
+                keep[first_valid[0]] = True
+
+        masked_ids = input_ids.clone()
+        masked_attention = torch.zeros_like(attention_mask)
+        pad_id = self._get_pad_token_id(self.model)
+
+        for idx in range(seq_len):
+            if keep[idx]:
+                masked_attention[0, idx] = 1
+            else:
+                masked_ids[0, idx] = pad_id
+                masked_attention[0, idx] = 0
+
+        return masked_ids, masked_attention
 
     # ============================================================
     # Sufficiency — keeping only top features
@@ -186,7 +273,8 @@ class CrossModalFaithfulness:
         image: torch.Tensor,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-        shap_values: np.ndarray,
+        model_token_scores: np.ndarray,
+        special_token_mask: np.ndarray,
         target_class: int,
     ) -> float:
         """
@@ -204,29 +292,17 @@ class CrossModalFaithfulness:
             )
             orig_prob = F.softmax(orig_out["logits"], dim=1)[0, target_class].item()
 
-        # Find top-k important token positions
-        abs_shap = np.abs(shap_values)
-        seq_len = input_ids.shape[1]
-        # Pad or truncate SHAP values to match sequence length
-        if len(abs_shap) < seq_len:
-            abs_shap = np.pad(abs_shap, (0, seq_len - len(abs_shap)))
-        elif len(abs_shap) > seq_len:
-            abs_shap = abs_shap[:seq_len]
-
-        top_k_indices = np.argsort(abs_shap)[-self.top_k:]
-
-        # Create masked input: keep only top-k tokens
-        masked_ids = input_ids.clone()
-        mask_token_id = self.model.text_encoder.backbone.config.pad_token_id or 0
-        for i in range(seq_len):
-            if i not in top_k_indices:
-                masked_ids[0, i] = mask_token_id
-
-        # Updated attention mask
-        masked_attention = torch.zeros_like(attention_mask)
-        for idx in top_k_indices:
-            if idx < seq_len:
-                masked_attention[0, idx] = 1
+        top_k_indices = self._get_text_feature_indices(
+            attention_mask=attention_mask,
+            model_token_scores=model_token_scores,
+            special_token_mask=special_token_mask,
+        )
+        masked_ids, masked_attention = self._build_text_variant(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            keep_indices=top_k_indices,
+            special_token_mask=special_token_mask,
+        )
 
         with torch.no_grad():
             masked_out = self.model(
@@ -296,7 +372,8 @@ class CrossModalFaithfulness:
         image: torch.Tensor,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-        shap_values: np.ndarray,
+        model_token_scores: np.ndarray,
+        special_token_mask: np.ndarray,
         target_class: int,
     ) -> float:
         """Text comprehensiveness: remove top-k important tokens."""
@@ -311,23 +388,21 @@ class CrossModalFaithfulness:
             )
             orig_prob = F.softmax(orig_out["logits"], dim=1)[0, target_class].item()
 
-        abs_shap = np.abs(shap_values)
-        seq_len = input_ids.shape[1]
-        if len(abs_shap) < seq_len:
-            abs_shap = np.pad(abs_shap, (0, seq_len - len(abs_shap)))
-        elif len(abs_shap) > seq_len:
-            abs_shap = abs_shap[:seq_len]
-
-        top_k_indices = np.argsort(abs_shap)[-self.top_k:]
-
-        # Remove top-k tokens (replace with padding)
-        masked_ids = input_ids.clone()
-        masked_attention = attention_mask.clone()
-        pad_id = self.model.text_encoder.backbone.config.pad_token_id or 0
-        for idx in top_k_indices:
-            if idx < seq_len:
-                masked_ids[0, idx] = pad_id
-                masked_attention[0, idx] = 0
+        top_k_indices = self._get_text_feature_indices(
+            attention_mask=attention_mask,
+            model_token_scores=model_token_scores,
+            special_token_mask=special_token_mask,
+        )
+        attention = attention_mask[0].detach().cpu().numpy().astype(bool)
+        special_mask = np.asarray(special_token_mask, dtype=bool)
+        candidate_indices = np.flatnonzero(attention & (~special_mask))
+        keep_indices = np.setdiff1d(candidate_indices, top_k_indices, assume_unique=True)
+        masked_ids, masked_attention = self._build_text_variant(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            keep_indices=keep_indices,
+            special_token_mask=special_token_mask,
+        )
 
         with torch.no_grad():
             masked_out = self.model(
@@ -478,7 +553,8 @@ class CrossModalFaithfulness:
         image: torch.Tensor,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-        shap_values: np.ndarray,
+        model_token_scores: np.ndarray,
+        special_token_mask: np.ndarray,
         target_class: int,
     ) -> np.ndarray:
         """Perturbation curve for text modality."""
@@ -487,30 +563,32 @@ class CrossModalFaithfulness:
         input_ids = input_ids.to(self.device)
         attention_mask = attention_mask.to(self.device)
 
-        seq_len = input_ids.shape[1]
-        abs_shap = np.abs(shap_values)
-        if len(abs_shap) < seq_len:
-            abs_shap = np.pad(abs_shap, (0, seq_len - len(abs_shap)))
-        elif len(abs_shap) > seq_len:
-            abs_shap = abs_shap[:seq_len]
-
-        sorted_indices = np.argsort(abs_shap)[::-1]  # Most important first
-        pad_id = getattr(
-            self.model.text_encoder.backbone.config, "pad_token_id", 0
-        ) or 0
+        top_indices = self._get_text_feature_indices(
+            attention_mask=attention_mask,
+            model_token_scores=model_token_scores,
+            special_token_mask=special_token_mask,
+        )
+        if top_indices.size == 0:
+            return np.array([], dtype=np.float32)
 
         curve = []
 
         for step in range(self.num_steps + 1):
-            n_remove = int((step / self.num_steps) * len(sorted_indices))
-
-            masked_ids = input_ids.clone()
-            masked_attn = attention_mask.clone()
-
-            for idx in sorted_indices[:n_remove]:
-                if idx < seq_len:
-                    masked_ids[0, idx] = pad_id
-                    masked_attn[0, idx] = 0
+            n_remove = int((step / self.num_steps) * len(top_indices))
+            attention = attention_mask[0].detach().cpu().numpy().astype(bool)
+            special_mask = np.asarray(special_token_mask, dtype=bool)
+            candidate_indices = np.flatnonzero(attention & (~special_mask))
+            keep_indices = np.setdiff1d(
+                candidate_indices,
+                top_indices[:n_remove],
+                assume_unique=True,
+            )
+            masked_ids, masked_attn = self._build_text_variant(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                keep_indices=keep_indices,
+                special_token_mask=special_token_mask,
+            )
 
             with torch.no_grad():
                 out = self.model(
@@ -540,21 +618,27 @@ class CrossModalFaithfulness:
         A high CMFS indicates that both modalities provide faithful,
         consistent explanations.
         """
-        components = [
-            max(metrics.get("vision_sufficiency", 0.0), 0.01),
-            max(metrics.get("text_sufficiency", 0.0), 0.01),
-            max(metrics.get("cross_modal_agreement", 0.0), 0.01),
-            max(
-                (
-                    metrics.get("vision_comprehensiveness", 0.0)
-                    + metrics.get("text_comprehensiveness", 0.0)
-                )
-                / 2.0,
-                0.01,
-            ),
+        comprehensiveness = (
+            metrics.get("vision_comprehensiveness", float("nan"))
+            + metrics.get("text_comprehensiveness", float("nan"))
+        ) / 2.0
+
+        raw_components = [
+            metrics.get("vision_sufficiency", float("nan")),
+            metrics.get("text_sufficiency", float("nan")),
+            metrics.get("cross_modal_agreement", float("nan")),
+            comprehensiveness,
         ]
 
-        # Geometric mean
+        components = []
+        for value in raw_components:
+            if not np.isfinite(value):
+                continue
+            components.append(max(min(float(value), 1.0), 0.01))
+
+        if len(components) < 3:
+            return float("nan")
+
         cmfs = np.exp(np.mean(np.log(components)))
         return float(cmfs)
 
@@ -600,16 +684,18 @@ class CrossModalFaithfulness:
                     # Get Grad-CAM
                     gradcam_out = gradcam_explainer.generate(
                         image=image,
-                        target_class=label,
+                        target_class=None,
                         input_ids=input_ids,
                         attention_mask=attention_mask,
                     )
+                    pred_class = gradcam_out["predicted_class"]
 
                     # Get SHAP
                     utterance = batch["utterance"][i]
                     shap_out = shap_explainer.explain(
                         utterance,
-                        target_class=label,
+                        image=image,
+                        target_class=pred_class,
                         emotion_names=emotion_names,
                     )
 
@@ -620,8 +706,10 @@ class CrossModalFaithfulness:
                         attention_mask=attention_mask,
                         gradcam_heatmap=gradcam_out["heatmap"],
                         shap_values=shap_out["shap_values"],
+                        model_token_scores=shap_out["model_token_scores"],
+                        special_token_mask=shap_out["special_token_mask"],
                         tokens=shap_out["tokens"],
-                        target_class=label,
+                        target_class=pred_class,
                     )
 
                     all_metrics.append(metrics)
@@ -638,15 +726,15 @@ class CrossModalFaithfulness:
         if all_metrics:
             for key in all_metrics[0].keys():
                 values = [m[key] for m in all_metrics]
-                avg_metrics[f"avg_{key}"] = float(np.mean(values))
-                avg_metrics[f"std_{key}"] = float(np.std(values))
+                avg_metrics[f"avg_{key}"] = float(np.nanmean(values))
+                avg_metrics[f"std_{key}"] = float(np.nanstd(values))
 
         # Per-class
         class_metrics = {}
         for emotion, metrics_list in per_class_metrics.items():
             if metrics_list:
                 class_metrics[emotion] = {
-                    key: float(np.mean([m[key] for m in metrics_list]))
+                    key: float(np.nanmean([m[key] for m in metrics_list]))
                     for key in metrics_list[0].keys()
                 }
 

@@ -11,6 +11,7 @@ Usage:
 """
 
 import argparse
+from copy import deepcopy
 import json
 import sys
 import os
@@ -41,6 +42,83 @@ def parse_args():
     return parser.parse_args()
 
 
+def _build_meld_dataset_kwargs(config: dict, split: str) -> dict:
+    dataset_cfg = config.get("dataset", {}).get("meld", {})
+    model_cfg = config.get("model", {})
+    text_backbone = model_cfg.get("text", {}).get(
+        "backbone", "microsoft/deberta-v3-base"
+    )
+    context_cfg = dataset_cfg.get("text_context", {})
+    quality_cfg = dataset_cfg.get("face_quality", {})
+
+    quality_filter = quality_cfg.get("filter_eval", False)
+    if split == "train":
+        quality_filter = quality_cfg.get("filter_train", False)
+
+    split_name = split
+    if split in {"val", "dev"}:
+        split_name = "dev"
+
+    return {
+        "root_dir": dataset_cfg.get("root_dir", "./datasets/meld"),
+        "split": split_name,
+        "image_size": dataset_cfg.get("image_size", 260),
+        "max_text_length": dataset_cfg.get("max_text_length", 128),
+        "text_model_name": text_backbone,
+        "use_dialogue_history": context_cfg.get("use_dialogue_history", False),
+        "history_window": context_cfg.get("history_window", 0),
+        "include_speaker_in_text": context_cfg.get("include_speaker", True),
+        "context_separator": context_cfg.get("separator", " [SEP] "),
+        "quality_filter": quality_filter,
+        "min_face_quality_score": quality_cfg.get("min_quality_score", 0.0),
+        "repair_invalid_faces": False,
+        "refresh_quality_cache": False,
+    }
+
+
+def _resolve_checkpoint_mode(checkpoint: dict, config: dict) -> str:
+    """Infer the model mode recorded in a checkpoint."""
+    return (
+        checkpoint.get("model_mode")
+        or checkpoint.get("config", {}).get("model", {}).get("mode")
+        or config.get("model", {}).get("mode")
+        or "multimodal"
+    )
+
+
+def _resolve_checkpoint_fusion(checkpoint: dict, config: dict) -> str:
+    """Infer the fusion strategy recorded in a checkpoint."""
+    return (
+        checkpoint.get("fusion_strategy")
+        or checkpoint.get("config", {}).get("model", {}).get("fusion", {}).get("strategy")
+        or config.get("model", {}).get("fusion", {}).get("strategy")
+        or "cross_attention"
+    )
+
+
+def _build_model_from_checkpoint(config: dict, checkpoint: dict):
+    """Recreate the architecture needed for a checkpoint."""
+    model_config = deepcopy(checkpoint.get("config") or config)
+    dataset_name = checkpoint.get("dataset_name") or model_config.get("dataset", {}).get("name", "meld")
+
+    model_config.setdefault("dataset", {})
+    model_config["dataset"]["name"] = dataset_name
+    model_config["dataset"].setdefault(dataset_name, {})
+    if "num_classes" in checkpoint:
+        model_config["dataset"][dataset_name]["num_classes"] = checkpoint["num_classes"]
+    if "class_names" in checkpoint:
+        model_config["dataset"][dataset_name]["class_names"] = checkpoint["class_names"]
+
+    model_config.setdefault("model", {})
+    model_config["model"]["mode"] = _resolve_checkpoint_mode(checkpoint, model_config)
+    model_config["model"].setdefault("fusion", {})
+    model_config["model"]["fusion"]["strategy"] = _resolve_checkpoint_fusion(
+        checkpoint, model_config
+    )
+
+    return build_model(model_config, mode=model_config["model"]["mode"])
+
+
 def main():
     args = parse_args()
     config = load_config(args.config)
@@ -55,12 +133,7 @@ def main():
     # Build dataset
     print(f"\nLoading {dataset_name} {args.split} set...")
     if dataset_name == "meld":
-        dataset = MELDDataset(
-            root_dir=dataset_cfg.get("root_dir", "./datasets/meld"),
-            split=args.split if args.split != "test" else "test",
-            image_size=dataset_cfg.get("image_size", 260),
-            text_model_name=config["model"]["text"]["backbone"],
-        )
+        dataset = MELDDataset(**_build_meld_dataset_kwargs(config, split=args.split if args.split != "test" else "test"))
     else:
         split_map = {"test": "val", "val": "val", "train": "train"}
         dataset = AffectNetDataset(
@@ -69,18 +142,26 @@ def main():
             num_classes=num_classes,
         )
 
+    checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    num_workers = config.get("training", {}).get("num_workers", 0)
+    pin_memory = config.get("training", {}).get("pin_memory", False)
     dataloader = DataLoader(
-        dataset, batch_size=args.batch_size, shuffle=False, num_workers=4
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
     )
 
     # Build and load model
     print("\nLoading model from checkpoint...")
-    model = build_model(config).to(device)
-    checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    model = _build_model_from_checkpoint(config, checkpoint).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
 
     print(f"  Loaded from epoch {checkpoint.get('epoch', '?')}")
+    print(f"  Model mode: {_resolve_checkpoint_mode(checkpoint, config)}")
+    print(f"  Fusion strategy: {_resolve_checkpoint_fusion(checkpoint, config)}")
 
     # Run evaluation
     print("\nRunning evaluation...")

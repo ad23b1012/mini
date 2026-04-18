@@ -44,6 +44,17 @@ dataset:
       - "Disgust"
       - "Anger"
     sentiment_classes: 3             # positive, negative, neutral
+    text_context:
+      use_dialogue_history: false
+      history_window: 0
+      include_speaker: true
+      separator: " [SEP] "
+    face_quality:
+      filter_train: true
+      filter_eval: false
+      min_quality_score: 0.55
+      repair_invalid: true
+      refresh_cache: false
 
 # ---------- Model ----------
 model:
@@ -53,7 +64,7 @@ model:
     pretrained: true
     feature_dim: 1408                # EfficientNet-B2 feature dim
     dropout: 0.3
-    freeze_layers: 0                 # Number of initial blocks to freeze (0 = train all)
+    freeze_layers: 5                 # Freeze first 5 blocks to save VRAM
 
   # Text encoder
   text:
@@ -61,7 +72,7 @@ model:
     pretrained: true
     feature_dim: 768                 # DeBERTa-v3-base hidden size
     dropout: 0.1
-    freeze_layers: 0                 # Number of layers to freeze
+    freeze_layers: 10                # Freeze first 10 of 12 layers to save VRAM
     max_length: 128
 
   # Fusion
@@ -80,8 +91,8 @@ model:
 
 # ---------- Training ----------
 training:
-  epochs: 50
-  batch_size: 32                     # Adjust based on your GPU VRAM
+  epochs: 70
+  batch_size: 16                     # Adjusted for 8GB VRAM with frozen layers
   accumulation_steps: 1              # Gradient accumulation
   
   optimizer:
@@ -103,7 +114,9 @@ training:
   loss:
     name: "focal"                    # "focal", "ce", "label_smoothing"
     focal_gamma: 2.0
-    focal_alpha: null                # Set to list of per-class weights, or null for uniform
+    focal_alpha: "auto"              # Auto-resolved from train distribution when supported
+    class_weight_strategy: "effective_num"
+    effective_num_beta: 0.999
     label_smoothing: 0.1
 
   early_stopping:
@@ -112,11 +125,11 @@ training:
     mode: "max"
 
   # Mixed precision
-  amp: true
+  amp: false
   
   # Data loading
-  num_workers: 4
-  pin_memory: true
+  num_workers: 0
+  pin_memory: false
 
   # Logging
   log_every_n_steps: 50

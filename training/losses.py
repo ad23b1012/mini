@@ -51,8 +51,10 @@ class FocalLoss(nn.Module):
             logits: [B, C] raw logits.
             targets: [B] class indices.
         """
+        # Clamp logits for numerical stability under AMP/fp16
+        logits = logits.float().clamp(-50, 50)
         ce_loss = F.cross_entropy(logits, targets, reduction="none")
-        p_t = torch.exp(-ce_loss)  # p_t = probability of correct class
+        p_t = torch.exp(-ce_loss).clamp(1e-7, 1.0 - 1e-7)
 
         focal_weight = (1 - p_t) ** self.gamma
 

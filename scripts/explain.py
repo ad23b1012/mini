@@ -21,6 +21,7 @@ Usage:
 """
 
 import argparse
+from datetime import datetime, timezone
 import json
 import sys
 import os
@@ -46,6 +47,7 @@ from utils.visualization import (
     plot_combined_explanation,
     plot_perturbation_curves,
 )
+from utils.face_quality import check_face_quality, get_face_quality_summary
 
 
 def parse_args():
@@ -58,6 +60,14 @@ def parse_args():
     parser.add_argument("--output-dir", type=str, default="./results/explanations")
     parser.add_argument("--nlg-mode", type=str, default="template",
                         choices=["template", "llm"])
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Random seed for reproducible sample selection")
+    parser.add_argument("--quality-filter", action="store_true", default=True,
+                        help="Filter out bad face crops before explaining")
+    parser.add_argument("--no-quality-filter", dest="quality_filter",
+                        action="store_false")
+    parser.add_argument("--min-confidence", type=float, default=0.10,
+                        help="Skip predictions below this confidence")
     return parser.parse_args()
 
 
@@ -68,6 +78,44 @@ def denormalize_image(image_tensor: torch.Tensor) -> np.ndarray:
     img = img.permute(1, 2, 0).numpy()
     img = np.clip(img * 255, 0, 255).astype(np.uint8)
     return img
+
+
+def sanitize_for_json(value):
+    """Recursively replace NaN/Inf values with None before saving."""
+    if isinstance(value, dict):
+        return {k: sanitize_for_json(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [sanitize_for_json(v) for v in value]
+    if isinstance(value, tuple):
+        return [sanitize_for_json(v) for v in value]
+    if isinstance(value, np.ndarray):
+        return sanitize_for_json(value.tolist())
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (np.floating, float)):
+        return None if not np.isfinite(value) else float(value)
+    if isinstance(value, (np.integer, int)):
+        return int(value)
+    return value
+
+
+def build_run_metadata(args, dataset_name: str, class_names: list, seed: int) -> dict:
+    """Describe how this explanation run was produced."""
+    return {
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "script": os.path.abspath(__file__),
+        "dataset": dataset_name,
+        "checkpoint": os.path.abspath(args.checkpoint),
+        "config": os.path.abspath(args.config),
+        "output_dir": os.path.abspath(args.output_dir),
+        "seed": int(seed),
+        "sample_idx": args.sample_idx,
+        "num_samples_requested": int(args.num_samples),
+        "nlg_mode": args.nlg_mode,
+        "quality_filter": bool(args.quality_filter),
+        "min_confidence": float(args.min_confidence),
+        "class_names": class_names,
+    }
 
 
 def explain_single_sample(
@@ -81,11 +129,13 @@ def explain_single_sample(
     output_dir: str,
     sample_id: int,
     device: str,
+    quality_filter: bool = True,
+    min_confidence: float = 0.10,
 ):
     """Run the full explanation pipeline on a single sample."""
-    print(f"\n{'─' * 50}")
+    print(f"\n{'-' * 50}")
     print(f"Explaining sample {sample_id}")
-    print(f"{'─' * 50}")
+    print(f"{'-' * 50}")
 
     image = sample["image"].unsqueeze(0).to(device)
     label = sample["label"]
@@ -95,11 +145,29 @@ def explain_single_sample(
     input_ids = sample.get("input_ids", None)
     attention_mask = sample.get("attention_mask", None)
     utterance = sample.get("utterance", "")
+    text_input = sample.get("text_input", utterance)
     speaker = sample.get("speaker", "Unknown")
 
     if input_ids is not None:
         input_ids = input_ids.unsqueeze(0).to(device)
         attention_mask = attention_mask.unsqueeze(0).to(device)
+
+    # ---- Face Quality Check ----
+    original_img = denormalize_image(sample["image"])
+
+    if quality_filter:
+        quality = check_face_quality(original_img)
+        quality_summary = get_face_quality_summary(quality)
+        print(f"  Face quality: {quality_summary}")
+
+        if not quality["is_valid"]:
+            print(f"  SKIPPED: Bad face crop ({quality['reason']})")
+            return {"sample_id": sample_id, "skipped": True,
+                    "skip_reason": quality["reason"],
+                    "true_emotion": emotion_name}
+    else:
+        quality = {"quality_score": -1}
+        original_img = denormalize_image(sample["image"])
 
     print(f"  True emotion: {emotion_name}")
     if utterance:
@@ -111,34 +179,52 @@ def explain_single_sample(
 
     # ---- 1. Grad-CAM ----
     print("  Running Grad-CAM...")
+
+    # Pass target_class=None: Grad-CAM will explain the model's *predicted*
+    # class (argmax of logits) rather than the ground-truth label.
     gradcam_result = gradcam_explainer.generate(
         image=image,
-        target_class=label,
+        target_class=None,
         input_ids=input_ids,
         attention_mask=attention_mask,
+        original_image=original_img,
     )
 
+    pred_confidence = gradcam_result['confidence']
     print(f"  Predicted: {class_names[gradcam_result['predicted_class']]} "
-          f"({gradcam_result['confidence']*100:.1f}%)")
+          f"({pred_confidence*100:.1f}%)")
     print(f"  Top face regions: {gradcam_result['region_scores']}")
 
+    # Skip low-confidence predictions if quality filter is on
+    if quality_filter and pred_confidence < min_confidence:
+        print(f"  SKIPPED: Confidence too low ({pred_confidence*100:.1f}% < {min_confidence*100:.0f}%)")
+        return {"sample_id": sample_id, "skipped": True,
+                "skip_reason": f"low_confidence ({pred_confidence:.3f})",
+                "true_emotion": emotion_name}
+
+    # Use face-masked heatmap for visualization (eliminates background noise)
+    vis_heatmap = gradcam_result.get("masked_heatmap", gradcam_result["heatmap"])
+
     # Save Grad-CAM visualization
-    original_img = denormalize_image(sample["image"])
     plot_gradcam_overlay(
         original_img,
-        gradcam_result["heatmap"],
+        vis_heatmap,
         emotion_name=class_names[gradcam_result["predicted_class"]],
         confidence=gradcam_result["confidence"],
         save_path=os.path.join(sample_dir, "gradcam_overlay.png"),
     )
 
+
     # ---- 2. SHAP (text) ----
     shap_result = None
     if is_multimodal and utterance:
         print("  Running SHAP on text...")
+        # Explain the model's predicted class, not the ground-truth label.
+        # Pass image= so SHAP evaluates in genuine multimodal context.
         shap_result = shap_explainer.explain(
-            text=utterance,
-            target_class=label,
+            text=text_input,
+            image=image,
+            target_class=gradcam_result["predicted_class"],
             emotion_names=class_names,
         )
 
@@ -164,8 +250,10 @@ def explain_single_sample(
                 attention_mask=attention_mask,
                 gradcam_heatmap=gradcam_result["heatmap"],
                 shap_values=shap_result["shap_values"],
+                model_token_scores=shap_result["model_token_scores"],
+                special_token_mask=shap_result["special_token_mask"],
                 tokens=shap_result["tokens"],
-                target_class=label,
+                target_class=gradcam_result["predicted_class"],  # predicted, not ground truth
             )
             print(f"  CMFS Score: {faithfulness_metrics['cmfs_score']:.3f}")
             print(f"  Cross-Modal Agreement: {faithfulness_metrics['cross_modal_agreement']:.3f}")
@@ -197,7 +285,7 @@ def explain_single_sample(
     if shap_result is not None:
         plot_combined_explanation(
             original_image=original_img,
-            heatmap=gradcam_result["heatmap"],
+            heatmap=vis_heatmap,
             tokens=shap_result["tokens"],
             shap_values=shap_result["shap_values"],
             region_scores=gradcam_result["region_scores"],
@@ -216,15 +304,18 @@ def explain_single_sample(
         "confidence": gradcam_result["confidence"],
         "region_scores": gradcam_result["region_scores"],
         "utterance": utterance,
+        "model_text_input": text_input,
         "speaker": speaker,
     }
     if token_importance:
         results["top_tokens"] = dict(list(token_importance.items())[:10])
     if faithfulness_metrics:
         results["faithfulness"] = faithfulness_metrics
+    if quality_filter:
+        results["face_quality_score"] = quality.get("quality_score", -1)
 
     with open(os.path.join(sample_dir, "results.json"), "w") as f:
-        json.dump(results, f, indent=2, default=str)
+        json.dump(sanitize_for_json(results), f, indent=2, default=str)
 
     return results
 
@@ -233,7 +324,8 @@ def main():
     args = parse_args()
     config = load_config(args.config)
     device = get_device()
-    set_seed(config.get("project", {}).get("seed", 42))
+    seed = args.seed if args.seed is not None else config.get("project", {}).get("seed", 42)
+    set_seed(seed)
 
     dataset_name = args.dataset or config["dataset"]["name"]
     dataset_cfg = config["dataset"].get(dataset_name, {})
@@ -306,6 +398,12 @@ def main():
     os.makedirs(output_dir, exist_ok=True)
 
     all_results = []
+    run_metadata = build_run_metadata(
+        args=args,
+        dataset_name=dataset_name,
+        class_names=class_names,
+        seed=seed,
+    )
 
     if args.sample_idx is not None:
         # Explain single sample
@@ -316,25 +414,71 @@ def main():
         )
         all_results.append(result)
     else:
-        # Explain N random samples
+        # Explain N random samples, trying extra to fill quota after filtering
+        max_attempts = min(args.num_samples * 5, len(dataset))
         indices = np.random.choice(
-            len(dataset), min(args.num_samples, len(dataset)), replace=False
+            len(dataset), max_attempts, replace=False
         )
+        explained_count = 0
+        skipped_count = 0
         for idx in indices:
+            if explained_count >= args.num_samples:
+                break
             sample = dataset[int(idx)]
             result = explain_single_sample(
                 model, sample, gradcam, shap_explainer, faithfulness,
                 nlg_generator, class_names, output_dir, int(idx), device,
+                quality_filter=args.quality_filter,
+                min_confidence=args.min_confidence,
             )
+            if result.get("skipped", False):
+                skipped_count += 1
+            else:
+                explained_count += 1
             all_results.append(result)
+
+        print(f"\n  Explained: {explained_count}, Skipped: {skipped_count}")
 
     # Save summary
     summary_path = os.path.join(output_dir, "explanation_summary.json")
     with open(summary_path, "w") as f:
-        json.dump(all_results, f, indent=2, default=str)
+        json.dump(sanitize_for_json(all_results), f, indent=2, default=str)
+
+    explained_results = [
+        result for result in all_results if not result.get("skipped", False)
+    ]
+    skipped_results = [
+        result for result in all_results if result.get("skipped", False)
+    ]
+
+    metadata_path = os.path.join(output_dir, "run_metadata.json")
+    with open(metadata_path, "w") as f:
+        json.dump(
+            sanitize_for_json(
+                {
+                    **run_metadata,
+                    "num_results_written": len(all_results),
+                    "num_explained": len(explained_results),
+                    "num_skipped": len(skipped_results),
+                    "explained_sample_ids": [
+                        result["sample_id"] for result in explained_results
+                    ],
+                    "skipped_sample_ids": [
+                        result["sample_id"] for result in skipped_results
+                    ],
+                }
+            ),
+            f,
+            indent=2,
+            default=str,
+        )
 
     print(f"\n{'=' * 60}")
-    print(f"Explanations generated for {len(all_results)} samples")
+    print(
+        "Explanations generated for "
+        f"{len(explained_results)} valid samples "
+        f"(processed {len(all_results)}, skipped {len(skipped_results)})"
+    )
     print(f"Output directory: {output_dir}")
     print(f"{'=' * 60}")
 

@@ -19,7 +19,7 @@ from typing import Optional, Dict
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.cuda.amp import GradScaler, autocast
+from torch.cuda.amp import GradScaler
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
@@ -113,6 +113,13 @@ class Trainer:
         self.current_epoch = 0
         self.global_step = 0
         self.best_checkpoints = []  # (metric_value, path) sorted by metric
+
+        # Metadata stamped into every checkpoint for downstream scripts
+        self.model_mode = config.get("model", {}).get("mode", "multimodal")
+        self.fusion_strategy = config.get("model", {}).get("fusion", {}).get(
+            "strategy", "cross_attention"
+        )
+        self.train_class_distribution = None  # set by train.py after construction
 
     def _build_loss(self, loss_cfg: dict) -> nn.Module:
         """Build loss function from config."""
@@ -283,12 +290,29 @@ class Trainer:
                     self.patience_counter = 0
                     print(f"  ★ New best {self.es_metric}: {current_metric:.4f}")
                 else:
-                    self.patience_counter += 1
-                    if self.patience_counter >= self.patience:
+                    # Don't count patience during LR warmup — the model hasn't
+                    # reached full LR yet and epoch-0 can look artificially "best"
+                    warmup_epochs = self.config.get("training", {}).get(
+                        "scheduler", {}
+                    ).get("warmup_epochs", 3)
+                    min_epochs = max(
+                        warmup_epochs + 2,
+                        self.config.get("training", {}).get(
+                            "early_stopping", {}
+                        ).get("min_epochs", 0),
+                    )
+                    if epoch < min_epochs:
                         print(
-                            f"\nEarly stopping triggered after {epoch + 1} epochs"
+                            f"  [early_stop] Warmup guard active "
+                            f"(epoch {epoch + 1} <= {min_epochs}) — patience not counted"
                         )
-                        break
+                    else:
+                        self.patience_counter += 1
+                        if self.patience_counter >= self.patience:
+                            print(
+                                f"\nEarly stopping triggered after {epoch + 1} epochs"
+                            )
+                            break
 
             # Step scheduler
             if self.scheduler and not isinstance(
@@ -331,7 +355,7 @@ class Trainer:
                 )
 
             # Forward pass with AMP
-            with autocast(enabled=self.use_amp):
+            with torch.amp.autocast(device_type=self.device, enabled=self.use_amp):
                 output = self.model(**forward_kwargs)
                 logits = output["logits"]
                 loss = self.criterion(logits, label)
@@ -406,7 +430,8 @@ class Trainer:
                     self.device
                 )
 
-            with autocast(enabled=self.use_amp):
+            # Forward pass with AMP
+            with torch.amp.autocast(device_type=self.device, enabled=self.use_amp):
                 output = self.model(**forward_kwargs)
                 logits = output["logits"]
                 loss = self.criterion(logits, label)
@@ -454,7 +479,15 @@ class Trainer:
             "metrics": metrics,
             "config": self.config,
             "global_step": self.global_step,
+            # Metadata for downstream scripts (evaluate, analyze_ambiguity)
+            "model_mode": self.model_mode,
+            "fusion_strategy": self.fusion_strategy,
+            "class_names": self.class_names,
+            "num_classes": self.num_classes,
+            "dataset_name": self.config.get("dataset", {}).get("name", "meld"),
         }
+        if self.train_class_distribution:
+            checkpoint["train_class_distribution"] = self.train_class_distribution
 
         if self.scheduler:
             checkpoint["scheduler_state_dict"] = self.scheduler.state_dict()

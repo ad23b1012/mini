@@ -28,7 +28,8 @@ from torch.utils.data import DataLoader
 
 from data.meld_dataset import MELDDataset
 from data.affectnet_dataset import AffectNetDataset
-from models.multimodal_model import MultimodalEmotionModel
+from models.multimodal_model import build_model
+
 from training.trainer import Trainer
 from training.metrics import EmotionMetrics
 from utils.helpers import set_seed, load_config, get_device
@@ -43,32 +44,15 @@ def parse_args():
     return parser.parse_args()
 
 
-def build_ablation_model(config: dict, mode: str, fusion: str) -> MultimodalEmotionModel:
-    """Build a model variant for ablation."""
-    dataset_name = config["dataset"]["name"]
-    num_classes = config["dataset"][dataset_name]["num_classes"]
-    model_cfg = config["model"]
-
-    model = MultimodalEmotionModel(
-        num_classes=num_classes,
-        mode=mode,
-        vision_backbone=model_cfg["vision"]["backbone"],
-        vision_pretrained=model_cfg["vision"]["pretrained"],
-        vision_feature_dim=model_cfg["vision"]["feature_dim"],
-        vision_dropout=model_cfg["vision"]["dropout"],
-        text_backbone=model_cfg["text"]["backbone"],
-        text_pretrained=model_cfg["text"]["pretrained"],
-        text_feature_dim=model_cfg["text"]["feature_dim"],
-        text_dropout=model_cfg["text"]["dropout"],
-        fusion_strategy=fusion,
-        fusion_hidden_dim=model_cfg["fusion"]["hidden_dim"],
-        fusion_num_heads=model_cfg["fusion"]["num_heads"],
-        fusion_dropout=model_cfg["fusion"]["dropout"],
-        fusion_num_layers=model_cfg["fusion"]["num_layers"],
-        classifier_hidden_dims=model_cfg["classifier"]["hidden_dims"],
-        classifier_dropout=model_cfg["classifier"]["dropout"],
-    )
-    return model
+def build_ablation_model(config: dict, mode: str, fusion: str):
+    """Build a model variant for ablation using the standard factory."""
+    from copy import deepcopy
+    abl_config = deepcopy(config)
+    abl_config.setdefault("model", {})["mode"] = mode
+    abl_config["model"].setdefault("fusion", {})["strategy"] = fusion
+    if mode == "vision_only":
+        abl_config["model"]["vision"]["freeze_layers"] = 2
+    return build_model(abl_config, mode=mode)
 
 
 def main():
@@ -172,6 +156,9 @@ def main():
             config=config,
             device=device,
         )
+        trainer.model_mode = exp["mode"]
+        trainer.fusion_strategy = exp["fusion"]
+        trainer.train_class_distribution = dict(train_dataset.get_class_distribution())
 
         best_val_metrics = trainer.train()
 

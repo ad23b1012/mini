@@ -68,6 +68,9 @@ class TextEncoder(nn.Module):
         if freeze_layers > 0:
             self._freeze_layers(freeze_layers)
 
+        # Enable gradient checkpointing to save VRAM
+        self.backbone.gradient_checkpointing_enable()
+
     def _freeze_layers(self, num_layers: int):
         """Freeze the embeddings and first N transformer layers."""
         # Freeze embeddings

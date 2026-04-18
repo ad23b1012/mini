@@ -27,9 +27,14 @@ from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from data.meld_dataset import MELDDataset
 from data.affectnet_dataset import AffectNetDataset
-from models.multimodal_model import build_model, MultimodalEmotionModel
+from models.multimodal_model import build_model
 from training.trainer import Trainer
-from utils.helpers import set_seed, load_config, get_device
+from utils.helpers import (
+    get_device,
+    load_config,
+    load_transfer_weights,
+    set_seed,
+)
 
 
 def parse_args():
@@ -63,6 +68,17 @@ def parse_args():
         help="Path to checkpoint to resume training from",
     )
     parser.add_argument(
+        "--init-checkpoint", type=str, default=None,
+        help="Initialize model weights from another checkpoint without loading optimizer state",
+    )
+    parser.add_argument(
+        "--transfer-component",
+        type=str,
+        default=None,
+        choices=["full_model", "vision_encoder", "text_encoder", "encoders"],
+        help="Subset of weights to load from --init-checkpoint",
+    )
+    parser.add_argument(
         "--debug", action="store_true",
         help="Quick debug run (1 epoch, small batch)",
     )
@@ -71,6 +87,63 @@ def parse_args():
         help="Override device (cuda/cpu/mps)",
     )
     return parser.parse_args()
+
+
+def _build_meld_dataset_kwargs(config: dict, split: str) -> dict:
+    """Build MELD dataset arguments from config."""
+    dataset_cfg = config.get("dataset", {}).get("meld", {})
+    model_cfg = config.get("model", {})
+    text_backbone = model_cfg.get("text", {}).get(
+        "backbone", "microsoft/deberta-v3-base"
+    )
+    context_cfg = dataset_cfg.get("text_context", {})
+    quality_cfg = dataset_cfg.get("face_quality", {})
+
+    quality_filter = quality_cfg.get("filter_train", False)
+    if split != "train":
+        quality_filter = quality_cfg.get("filter_eval", False)
+
+    return {
+        "root_dir": dataset_cfg.get("root_dir", "./datasets/meld"),
+        "split": split,
+        "image_size": dataset_cfg.get("image_size", 260),
+        "max_text_length": dataset_cfg.get("max_text_length", 128),
+        "text_model_name": text_backbone,
+        "use_dialogue_history": context_cfg.get("use_dialogue_history", False),
+        "history_window": context_cfg.get("history_window", 0),
+        "include_speaker_in_text": context_cfg.get("include_speaker", True),
+        "context_separator": context_cfg.get("separator", " [SEP] "),
+        "quality_filter": quality_filter,
+        "min_face_quality_score": quality_cfg.get("min_quality_score", 0.0),
+        "repair_invalid_faces": quality_cfg.get("repair_invalid", False) and split == "train",
+        "refresh_quality_cache": quality_cfg.get("refresh_cache", False) and split == "train",
+    }
+
+
+def resolve_auto_focal_alpha(config: dict, train_dataset) -> None:
+    """Populate focal alpha from the current train distribution when requested."""
+    loss_cfg = config.get("training", {}).get("loss", {})
+    if loss_cfg.get("name", "focal") != "focal":
+        return
+
+    focal_alpha = loss_cfg.get("focal_alpha", None)
+    if focal_alpha not in (None, "auto"):
+        return
+
+    strategy = loss_cfg.get("class_weight_strategy", "effective_num")
+    beta = loss_cfg.get("effective_num_beta", 0.999)
+
+    if hasattr(train_dataset, "get_class_weights"):
+        weights = train_dataset.get_class_weights(strategy=strategy, beta=beta)
+    elif hasattr(train_dataset, "class_weights"):
+        weights = train_dataset.class_weights
+    else:
+        return
+
+    loss_cfg["focal_alpha"] = [float(value) for value in weights.tolist()]
+    print("\nResolved focal_alpha from train distribution:")
+    for emotion, weight in zip(train_dataset.get_class_distribution().keys(), loss_cfg["focal_alpha"]):
+        print(f"  {emotion}: {weight:.4f}")
 
 
 def build_dataloaders(config: dict, dataset_name: str, mode: str):
@@ -87,20 +160,8 @@ def build_dataloaders(config: dict, dataset_name: str, mode: str):
     )
 
     if dataset_name == "meld":
-        train_dataset = MELDDataset(
-            root_dir=dataset_cfg.get("root_dir", "./datasets/meld"),
-            split="train",
-            image_size=dataset_cfg.get("image_size", 260),
-            max_text_length=dataset_cfg.get("max_text_length", 128),
-            text_model_name=text_backbone,
-        )
-        val_dataset = MELDDataset(
-            root_dir=dataset_cfg.get("root_dir", "./datasets/meld"),
-            split="dev",
-            image_size=dataset_cfg.get("image_size", 260),
-            max_text_length=dataset_cfg.get("max_text_length", 128),
-            text_model_name=text_backbone,
-        )
+        train_dataset = MELDDataset(**_build_meld_dataset_kwargs(config, split="train"))
+        val_dataset = MELDDataset(**_build_meld_dataset_kwargs(config, split="dev"))
     else:  # affectnet
         train_dataset = AffectNetDataset(
             root_dir=dataset_cfg.get("root_dir", "./datasets/affectnet"),
@@ -120,6 +181,8 @@ def build_dataloaders(config: dict, dataset_name: str, mode: str):
     train_dist = train_dataset.get_class_distribution()
     for emotion, count in train_dist.items():
         print(f"  {emotion}: {count}")
+
+    resolve_auto_focal_alpha(config, train_dataset)
 
     # Balanced sampling for training
     sampler = None
@@ -150,7 +213,7 @@ def build_dataloaders(config: dict, dataset_name: str, mode: str):
         pin_memory=pin_memory,
     )
 
-    return train_loader, val_loader
+    return train_loader, val_loader, train_dataset, val_dataset
 
 
 def main():
@@ -168,6 +231,8 @@ def main():
         config["training"]["batch_size"] = args.batch_size
     if args.lr:
         config["training"]["optimizer"]["lr"] = args.lr
+    if args.resume and args.init_checkpoint:
+        raise ValueError("Use either --resume or --init-checkpoint, not both.")
 
     # Debug mode
     if args.debug:
@@ -186,28 +251,43 @@ def main():
     # Dataset
     dataset_name = config["dataset"]["name"]
     mode = args.mode or "multimodal"
+    config.setdefault("model", {})["mode"] = mode
 
     # Build dataloaders
     print(f"\nLoading {dataset_name} dataset...")
-    train_loader, val_loader = build_dataloaders(config, dataset_name, mode)
+    train_loader, val_loader, train_dataset, _ = build_dataloaders(config, dataset_name, mode)
 
     # Build model
     print(f"\nBuilding model (mode: {mode})...")
 
-    # Override mode in model building
-    model = build_model(config)
-    if mode != "multimodal":
-        # Rebuild with different mode
-        model = MultimodalEmotionModel(
-            num_classes=config["dataset"][dataset_name]["num_classes"],
-            mode=mode,
-            vision_backbone=config["model"]["vision"]["backbone"],
-            vision_pretrained=config["model"]["vision"]["pretrained"],
-            text_backbone=config["model"]["text"]["backbone"],
-            text_pretrained=config["model"]["text"]["pretrained"],
-            fusion_strategy=config["model"]["fusion"]["strategy"],
-            fusion_hidden_dim=config["model"]["fusion"]["hidden_dim"],
+    # For vision-only: unfreeze more layers (text signal is absent, vision must
+    # carry everything) and extend patience so the model has time to converge.
+    vision_freeze_layers = config["model"]["vision"]["freeze_layers"]
+    es_patience = config.get("training", {}).get("early_stopping", {}).get("patience", 10)
+    if mode == "vision_only":
+        vision_freeze_layers = 2  # unfreeze blocks 2-7 (was 5)
+        es_patience = 15           # more time without text signal
+        config.setdefault("training", {}).setdefault("early_stopping", {})["patience"] = es_patience
+        config["model"]["vision"]["freeze_layers"] = vision_freeze_layers
+        print(f"  [vision_only] vision_freeze_layers overridden to {vision_freeze_layers}")
+        print(f"  [vision_only] early_stopping patience overridden to {es_patience}")
+
+    # Build model once with the correct settings
+    model = build_model(config, mode=mode)
+
+    if args.init_checkpoint:
+        transfer_component = args.transfer_component or "vision_encoder"
+        transfer_report = load_transfer_weights(
+            model=model,
+            checkpoint_path=args.init_checkpoint,
+            component=transfer_component,
+            map_location=device,
         )
+        config.setdefault("training", {})["transfer"] = {
+            "init_checkpoint": args.init_checkpoint,
+            "component": transfer_component,
+            "report": transfer_report,
+        }
 
     # Build trainer
     trainer = Trainer(
@@ -217,6 +297,11 @@ def main():
         config=config,
         device=device,
     )
+
+    # Stamp metadata so checkpoints are self-describing
+    trainer.model_mode = mode
+    trainer.fusion_strategy = config["model"]["fusion"]["strategy"]
+    trainer.train_class_distribution = dict(train_dataset.get_class_distribution())
 
     # Resume from checkpoint if specified
     if args.resume:

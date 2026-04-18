@@ -1,5 +1,9 @@
 # MMER-XAI
 
+# Virtual environments
+.venv/
+.uv/
+
 # Byte-compiled
 __pycache__/
 *.py[cod]

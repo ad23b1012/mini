@@ -38,7 +38,7 @@ class GradCAMExplainer:
         model: torch.nn.Module,
         target_layer: torch.nn.Module,
         device: str = "cuda",
-        use_gradcam_pp: bool = False,
+        use_gradcam_pp: bool = True,
     ):
         """
         Args:
@@ -84,6 +84,7 @@ class GradCAMExplainer:
         target_class: Optional[int] = None,
         input_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        original_image: Optional[np.ndarray] = None,
     ) -> dict:
         """
         Generate Grad-CAM heatmap for a single image.
@@ -109,7 +110,10 @@ class GradCAMExplainer:
         image = image.to(self.device).requires_grad_(True)
 
         # Forward pass
-        forward_kwargs = {"image": image, "return_features": True}
+        # Keep logits identical to normal inference. The hook captures
+        # activations directly from the target layer, so we do not need to
+        # enable the alternate feature-return path here.
+        forward_kwargs = {"image": image, "return_features": False}
         if input_ids is not None:
             forward_kwargs["input_ids"] = input_ids.to(self.device)
             forward_kwargs["attention_mask"] = attention_mask.to(self.device)
@@ -167,29 +171,312 @@ class GradCAMExplainer:
         input_h, input_w = image.shape[2], image.shape[3]
         heatmap = cv2.resize(cam_np, (input_w, input_h))
 
-        # Compute region-level scores
-        region_scores = self._compute_region_scores(heatmap)
+        # Gaussian smoothing to fill sparse activations and produce
+        # smoother, more anatomically meaningful heatmaps
+        heatmap = cv2.GaussianBlur(heatmap, (0, 0), sigmaX=4.0)
+
+        # Remove noise floor (pixels below threshold)
+        heatmap[heatmap < 0.05] = 0.0
+
+        # Re-normalize to [0, 1] after smoothing
+        if heatmap.max() > 0:
+            heatmap = heatmap / heatmap.max()
+
+        # Compute region-level scores (use original image for landmark detection)
+        self._last_masked_heatmap = None  # Reset before computation
+        self._last_face_mask = None
+        region_scores = self._compute_region_scores(heatmap, original_image)
+
+        # Use face-masked heatmap for visualization if available
+        masked_heatmap = getattr(self, '_last_masked_heatmap', None)
+        if masked_heatmap is None:
+            masked_heatmap = heatmap  # Fallback to raw heatmap
 
         return {
             "heatmap": heatmap,
+            "masked_heatmap": masked_heatmap,
             "predicted_class": target_class,
             "confidence": confidence,
             "region_scores": region_scores,
         }
 
-    def _compute_region_scores(self, heatmap: np.ndarray) -> dict:
+    def _compute_region_scores(
+        self, heatmap: np.ndarray, original_image: np.ndarray = None
+    ) -> dict:
         """
         Map Grad-CAM heatmap to facial region importance scores.
 
-        Divides the face into anatomical regions (approximate) and
-        computes average importance for each region.
+        Uses MediaPipe FaceMesh to detect 468 facial landmarks and maps
+        heatmap importance to actual anatomical regions. Falls back to
+        static grid if landmarks cannot be detected.
 
-        Regions are based on typical face proportions:
-            - Forehead: top 25%
-            - Eyes: 25-45% vertically, split L/R
-            - Nose: center 35-60%
-            - Mouth: 60-80%
-            - Jaw/Chin: bottom 20%
+        Args:
+            heatmap: Grad-CAM heatmap [H, W] in [0, 1].
+            original_image: Original face image [H, W, 3] (RGB, 0-255).
+                            Required for landmark detection.
+        """
+        h, w = heatmap.shape
+
+        # Try landmark-based scoring first
+        if original_image is not None:
+            landmark_scores = self._compute_landmark_region_scores(
+                heatmap, original_image
+            )
+            if landmark_scores is not None:
+                return landmark_scores
+
+        # Fallback: static grid (only when landmarks fail)
+        return self._compute_grid_region_scores(heatmap)
+
+    def _create_face_mask(
+        self, landmarks, h: int, w: int
+    ) -> np.ndarray:
+        """
+        Create a binary face mask using the FaceMesh face oval contour.
+
+        This eliminates all background pixels from the heatmap, ensuring
+        only face-region activations contribute to region scoring.
+
+        Returns:
+            Binary mask [H, W] with 1 inside the face, 0 outside.
+        """
+        # MediaPipe FACEMESH_FACE_OVAL indices (ordered contour of the face)
+        face_oval_indices = [
+            10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288,
+            397, 365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136,
+            172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109,
+        ]
+
+        contour_pts = []
+        for idx in face_oval_indices:
+            lm = landmarks.landmark[idx]
+            px = int(lm.x * w)
+            py = int(lm.y * h)
+            contour_pts.append([px, py])
+
+        contour_pts = np.array(contour_pts, dtype=np.int32)
+
+        mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.fillConvexPoly(mask, contour_pts, 1)
+
+        return mask.astype(np.float32)
+
+    def _get_landmark_points(
+        self, landmarks, indices: list, h: int, w: int
+    ) -> np.ndarray:
+        """Convert landmark indices to pixel coordinates [N, 2]."""
+        pts = []
+        for idx in indices:
+            if idx >= len(landmarks.landmark):
+                continue
+            lm = landmarks.landmark[idx]
+            px = max(0, min(w - 1, int(lm.x * w)))
+            py = max(0, min(h - 1, int(lm.y * h)))
+            pts.append([px, py])
+        return np.array(pts, dtype=np.int32)
+
+    def _polygon_region_score(
+        self, heatmap: np.ndarray, points: np.ndarray, pad: int = 8,
+        use_sum: bool = False, total_activation: float = 1.0,
+    ) -> float:
+        """
+        Compute heatmap importance inside a convex hull polygon region.
+
+        Uses cv2.fillConvexPoly to create a filled mask from the landmark
+        points. Supports two scoring modes:
+          - mean: average heatmap value inside the polygon
+          - sum (area-weighted): proportion of total activation in this region
+
+        The sum mode prevents large regions (like jaw_chin) from dominating
+        scores just because they cover more pixels.
+
+        Args:
+            heatmap: Grad-CAM heatmap [H, W] in [0, 1].
+            points: Landmark coordinates [N, 2].
+            pad: Pixel padding to expand the polygon.
+            use_sum: If True, return sum/total_activation instead of mean.
+            total_activation: Total heatmap activation (for normalization).
+
+        Returns:
+            Region importance score.
+        """
+        if len(points) < 3:
+            return 0.0
+
+        h, w = heatmap.shape
+
+        # Expand polygon slightly outward from centroid for better coverage
+        if pad > 0:
+            centroid = points.mean(axis=0)
+            direction = points.astype(np.float64) - centroid
+            norms = np.linalg.norm(direction, axis=1, keepdims=True)
+            norms = np.clip(norms, 1e-6, None)
+            direction = direction / norms
+            points = (points.astype(np.float64) + direction * pad).astype(np.int32)
+            # Clamp to image bounds
+            points[:, 0] = np.clip(points[:, 0], 0, w - 1)
+            points[:, 1] = np.clip(points[:, 1], 0, h - 1)
+
+        # Create filled polygon mask
+        mask = np.zeros((h, w), dtype=np.uint8)
+        hull = cv2.convexHull(points)
+        cv2.fillConvexPoly(mask, hull, 1)
+
+        # Compute heatmap importance inside the polygon
+        masked_values = heatmap[mask > 0]
+        if masked_values.size == 0:
+            return 0.0
+
+        if use_sum:
+            return float(masked_values.sum() / total_activation)
+        return float(masked_values.mean())
+
+    def _compute_landmark_region_scores(
+        self, heatmap: np.ndarray, original_image: np.ndarray
+    ) -> dict:
+        """
+        Compute region scores using MediaPipe FaceMesh landmarks.
+
+        Pipeline:
+          1. Detect 468 facial landmarks via FaceMesh
+          2. Create face-contour mask to eliminate background
+          3. Apply mask to heatmap (zero out non-face areas)
+          4. Score each anatomical region using convex-hull polygons
+
+        Returns:
+            dict mapping region names to normalized importance scores,
+            or None if face landmarks cannot be detected (triggers fallback).
+        """
+        import mediapipe as mp
+
+        h, w = heatmap.shape
+
+        # Initialize FaceMesh
+        mp_face_mesh = mp.solutions.face_mesh
+        face_mesh = mp_face_mesh.FaceMesh(
+            static_image_mode=True,
+            max_num_faces=1,
+            refine_landmarks=True,
+            min_detection_confidence=0.3,
+        )
+
+        # Ensure image is uint8 RGB
+        if original_image.dtype != np.uint8:
+            img = np.uint8(np.clip(original_image, 0, 255))
+        else:
+            img = original_image.copy()
+
+        # Resize image to match heatmap if needed
+        if img.shape[:2] != (h, w):
+            img = cv2.resize(img, (w, h))
+
+        results = face_mesh.process(img)
+        face_mesh.close()
+
+        if not results.multi_face_landmarks:
+            return None  # Fall back to grid
+
+        landmarks = results.multi_face_landmarks[0]
+
+        # ---- Step 1: Create face mask and apply to heatmap ----
+        face_mask = self._create_face_mask(landmarks, h, w)
+        masked_heatmap = heatmap * face_mask
+
+        # Re-normalize masked heatmap to [0, 1]
+        if masked_heatmap.max() > 0:
+            masked_heatmap = masked_heatmap / masked_heatmap.max()
+
+        # Store masked heatmap for visualization (set as instance var)
+        self._last_masked_heatmap = masked_heatmap
+        self._last_face_mask = face_mask
+
+        # ---- Step 2: Define anatomical region landmark groups ----
+        # Each group uses distinct, anatomically accurate FaceMesh indices
+        region_indices = {
+            "left_eyebrow": [70, 63, 105, 66, 107, 55, 65, 52, 53, 46],
+            "right_eyebrow": [300, 293, 334, 296, 336, 285, 295, 282, 283, 276],
+            "left_eye": [
+                33, 7, 163, 144, 145, 153, 154, 155, 133, 173,
+                157, 158, 159, 160, 161, 246,
+            ],
+            "right_eye": [
+                362, 382, 381, 380, 374, 373, 390, 249, 263, 466,
+                388, 387, 386, 385, 384, 398,
+            ],
+            "nose": [
+                1, 2, 98, 327, 168, 6, 197, 195, 5, 4,
+                19, 94, 370, 114, 217, 126, 209, 49, 131, 134,
+                51, 281, 363, 360, 279, 429, 437, 343,
+            ],
+            "mouth": [
+                61, 146, 91, 181, 84, 17, 314, 405, 321, 375,
+                291, 308, 324, 318, 402, 317, 14, 87, 178, 88,
+                95, 78, 191, 80, 81, 82, 13, 312, 311, 310, 415,
+            ],
+            "jaw_chin": [
+                # Only the chin/lower jaw area (below the mouth, not full contour)
+                152, 377, 400, 378, 379, 365,  # right lower chin
+                148, 176, 149, 150, 136, 172,  # left lower chin
+            ],
+        }
+
+        # ---- Step 3: Compute area-weighted scores for each region ----
+        # Use proportion of total activation (not mean) so large regions like
+        # jaw_chin don't dominate just because their polygon is bigger.
+        total_activation = float(masked_heatmap.sum()) + 1e-8
+        scores = {}
+        for region_name, indices in region_indices.items():
+            pts = self._get_landmark_points(landmarks, indices, h, w)
+            if len(pts) < 3:
+                scores[region_name] = 0.0
+                continue
+            scores[region_name] = self._polygon_region_score(
+                masked_heatmap, pts, pad=8, use_sum=True,
+                total_activation=total_activation,
+            )
+
+        # ---- Step 4: Forehead — special handling ----
+        # Forehead = area above eyebrows, bounded by face contour width
+        # Get eyebrow top boundary
+        eyebrow_all = region_indices["left_eyebrow"] + region_indices["right_eyebrow"]
+        eyebrow_pts = self._get_landmark_points(landmarks, eyebrow_all, h, w)
+
+        if len(eyebrow_pts) > 0:
+            min_eyebrow_y = int(eyebrow_pts[:, 1].min())
+            min_face_x = int(eyebrow_pts[:, 0].min())
+            max_face_x = int(eyebrow_pts[:, 0].max())
+
+            # Also get the top of the face contour for better x-bounds
+            face_oval_top = [10, 338, 297, 109, 67, 103, 54, 21, 162]
+            oval_pts = self._get_landmark_points(landmarks, face_oval_top, h, w)
+            if len(oval_pts) > 0:
+                min_face_x = min(min_face_x, int(oval_pts[:, 0].min()))
+                max_face_x = max(max_face_x, int(oval_pts[:, 0].max()))
+
+            # Clamp boundaries
+            min_eyebrow_y = max(1, min_eyebrow_y)
+            min_face_x = max(0, min_face_x)
+            max_face_x = min(w, max_face_x)
+
+            # Extract forehead region (only within face contour width)
+            forehead_region = masked_heatmap[:min_eyebrow_y, min_face_x:max_face_x]
+            if forehead_region.size > 0:
+                scores["forehead"] = float(forehead_region.sum() / total_activation)
+            else:
+                scores["forehead"] = 0.0
+        else:
+            scores["forehead"] = 0.0
+
+        # ---- Step 5: Normalize scores to sum to 1 ----
+        total = sum(scores.values()) + 1e-8
+        scores = {k: v / total for k, v in scores.items()}
+
+        return scores
+
+    def _compute_grid_region_scores(self, heatmap: np.ndarray) -> dict:
+        """
+        Fallback: Map Grad-CAM heatmap to facial region importance scores
+        using a static grid when landmarks cannot be detected.
         """
         h, w = heatmap.shape
 

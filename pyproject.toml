@@ -15,6 +15,7 @@ dependencies = [
     # Transformers / NLP
     "transformers>=4.36.0",
     "tokenizers>=0.15.0",
+    "sentencepiece>=0.1.99",
     # Vision
     "timm>=0.9.12",
     "Pillow>=10.0.0",
@@ -36,6 +37,8 @@ dependencies = [
     "tqdm>=4.65.0",
     # Video Processing (MELD)
     "opencv-python>=4.8.0",
+    # Face Detection & Landmarks
+    "mediapipe>=0.10.0,<0.10.15",
     # Utilities
     "requests>=2.31.0",
     "gdown>=4.7.0",
@@ -58,3 +61,14 @@ dev = [
     "pytest>=7.0",
     "ipykernel>=6.0",
 ]
+
+# ---------- UV: Use CUDA 12.4 PyTorch wheels ----------
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu124" }]
+torchvision = [{ index = "pytorch-cu124" }]
+torchaudio = [{ index = "pytorch-cu124" }]

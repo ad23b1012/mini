@@ -119,6 +119,7 @@ class MultimodalEmotionModel(nn.Module):
         """
         super().__init__()
         self.mode = mode
+        self.fusion_strategy = fusion_strategy
         self.num_classes = num_classes
 
         if classifier_hidden_dims is None:
@@ -277,7 +278,7 @@ class MultimodalEmotionModel(nn.Module):
         return result
 
 
-def build_model(config: dict) -> MultimodalEmotionModel:
+def build_model(config: dict, mode: Optional[str] = None) -> MultimodalEmotionModel:
     """
     Factory function to build model from config dictionary.
 
@@ -300,9 +301,11 @@ def build_model(config: dict) -> MultimodalEmotionModel:
     fusion_cfg = model_cfg.get("fusion", {})
     classifier_cfg = model_cfg.get("classifier", {})
 
+    resolved_mode = mode or model_cfg.get("mode", "multimodal")
+
     model = MultimodalEmotionModel(
         num_classes=num_classes,
-        mode="multimodal",
+        mode=resolved_mode,
         # Vision
         vision_backbone=vision_cfg.get("backbone", "efficientnet_b2"),
         vision_pretrained=vision_cfg.get("pretrained", True),
